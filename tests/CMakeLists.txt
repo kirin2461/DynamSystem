@@ -25,6 +25,8 @@ add_executable(ncp_tests
     test_paranoid.cpp
     test_secure_memory.cpp
     test_i2p.cpp
+    test_tor_manager.cpp      # Managed Tor + PT tests
+    test_kill_switch.cpp        # Kill switch filter tests
     test_critical_fixes.cpp  # Critical security fixes tests (Issue #17)
     test_l3_l2_stealth.cpp   # L3/L2 Stealth tests (Phase 1-3)
     # --- New comprehensive test suite ---
@@ -34,6 +36,15 @@ add_executable(ncp_tests
     test_burst_morpher.cpp
     test_protocol_morph.cpp
     test_port_knock.cpp
+    test_reality.cpp
+    test_stegodns.cpp
+    test_porthop.cpp            # M2: port-hopping transport tests
+    test_mimicry_stats.cpp      # M5: statistical profile tests
+    test_desync_confuse.cpp   # M3: TCP state confusion builders tests
+    test_aemm.cpp             # M9: Reed-Solomon erasure coding tests
+    test_fog.cpp               # M7: fog mesh relay tests
+    test_semfluid.cpp          # M8: semantic fluid transport tests
+    test_xdp.cpp
     test_probe_resist.cpp
     test_geneva.cpp
     test_packet_interceptor.cpp
@@ -44,6 +55,8 @@ add_executable(ncp_tests
     # --- R11-R13 fixes test suite ---
     test_r13_fixes.cpp       # Tests for R11-R13 critical fixes
     test_thread_safety.cpp   # Thread safety verification tests
+    test_bypass_features.cpp # Hostlist/proxy/blockcheck/zapret-import/detector
+    test_spa.cpp            # Enterprise SPA (Ed25519 + ipset) tests
 )
 
 target_link_libraries(ncp_tests
@@ -58,6 +71,21 @@ target_include_directories(ncp_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/include
     ${CMAKE_SOURCE_DIR}/src/core
     ${CMAKE_SOURCE_DIR}/src
+)
+
+# ==================== Standalone functional check ====================
+# End-to-end functional verification of the core library (crypto, E2E, DoH,
+# QUIC/ipfrag, hostlists, zapret import, presets, detector, license, network,
+# mimicry). Not a gtest: run directly as `ncp_functional_check`.
+add_executable(ncp_functional_check functional_check.cpp)
+target_link_libraries(ncp_functional_check PRIVATE ncp_core)
+add_dependencies(ncp_functional_check ncp_core)
+target_include_directories(ncp_functional_check PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core/include
+)
+set_target_properties(ncp_functional_check PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
 )
 
 # ==================== Compiler Warning Suppression ====================

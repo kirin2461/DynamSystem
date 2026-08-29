@@ -25,12 +25,23 @@ set(NCP_CORE_SRC_SOURCES
     src/spoofer.cpp
     src/ncp_dpi.cpp
     src/ncp_dpi_zapret.cpp
+    # Bypass feature set (hostlists, proxy mode, blockcheck, detectors)
+    src/ncp_hostlist.cpp
+    src/ncp_zapret_import.cpp
+    src/ncp_proxy.cpp
+    src/ncp_tor_manager.cpp       # Managed Tor + pluggable transports (obfs4/Snowflake)
+    src/ncp_blockcheck.cpp
+    src/autopilot.cpp
+    src/ncp_dpi_detector.cpp
+    src/ncp_quic.cpp
+    src/ncp_ipfrag.cpp
     src/tls_fingerprint.cpp
     src/dpi_advanced.cpp
     src/secure_buffer.cpp
     src/ncp_arp.cpp
     src/ncp_thread_pool.cpp
     src/ncp_dummy.cpp
+    src/ncp_wfp_guids.cpp        # WFP GUID definitions missing from mingw-w64
     src/ncp_timing.cpp
     src/ncp_identity.cpp
     src/ncp_entropy_masking.cpp
@@ -45,6 +56,16 @@ set(NCP_CORE_SRC_SOURCES
     src/ncp_probe_resist.cpp     # Phase 3: active probing resistance
     src/ncp_orchestrator.cpp     # Phase 4: unified pipeline orchestrator
     src/ncp_port_knock.cpp       # Phase 5: port knocking (TOTP/SPA/covert)
+    src/ncp_spa.cpp              # Enterprise SPA (Ed25519 + ipset)
+    src/ncp_reality.cpp          # Enterprise M1: XTLS-Reality-style fallback
+    src/ncp_stegodns.cpp         # Enterprise M4: steganographic DNS discovery
+    src/ncp_porthop.cpp          # M2: UDP port-hopping transport
+    src/ncp_mimicry_stats.cpp    # M5: statistical traffic profiles
+    src/ncp_desync_confuse.cpp        # M3: TCP state confusion builders (desync engine)
+    src/ncp_aemm.cpp                  # M9: Reed-Solomon erasure coding core (K of N)
+    src/ncp_fog.cpp              # M7: cooperative fog mesh overlay relay
+    src/ncp_semfluid.cpp         # M8: semantic HTTP fluid transport
+    src/ncp_xdp.cpp              # Enterprise: eBPF/XDP kernel packet processing
     # L3/L2 Stealth modules (Anti-ISP fingerprinting)
     src/ncp_l3_stealth.cpp       # Phase 1: IPID/TTL/MSS/FlowLabel normalization
     src/ncp_packet_interceptor.cpp # Phase 2: NFQUEUE/WinDivert packet interception + tunneling
@@ -96,6 +117,9 @@ set(NCP_CORE_SRC_SOURCES
     include/ncp_probe_resist.hpp
     include/ncp_orchestrator.hpp
     include/ncp_port_knock.hpp
+    include/ncp_spa.hpp
+    include/ncp_reality.hpp
+    include/ncp_stegodns.hpp
     # New Anti-TSPU headers
     include/ncp_packet_pipeline.hpp
     include/ncp_dns_leak_prevention.hpp
@@ -129,6 +153,7 @@ list(APPEND NCP_CORE_SRC_SOURCES
     src/mimicry.cpp
     src/i2p.cpp
     src/security.cpp
+    src/ncp_pcap_dyn.cpp
 )
 
 # Header files in include/ subdirectory
@@ -161,6 +186,8 @@ set(NCP_CORE_INCLUDE_HEADERS
     include/ncp_probe_resist.hpp
     include/ncp_orchestrator.hpp
     include/ncp_port_knock.hpp
+    include/ncp_reality.hpp
+    include/ncp_stegodns.hpp
     # Geneva / Protocol Morph headers
     include/ncp_geneva_ga.hpp
     include/ncp_protocol_morph.hpp
@@ -237,8 +264,23 @@ else()
     )
 endif()
 
+# ==================== spdlog (optional logger) ====================
+find_package(spdlog CONFIG QUIET)
+if(spdlog_FOUND)
+    target_link_libraries(ncp_core PUBLIC spdlog::spdlog)
+    target_compile_definitions(ncp_core PUBLIC HAVE_SPDLOG)
+    message(STATUS "Found spdlog")
+endif()
+
 # ==================== Required: libsodium ====================
 # Try vcpkg first (unofficial-sodium)
+# SQLite3 (optional) — enables the real Database backend in db.cpp
+find_package(SQLite3 QUIET)
+if(SQLite3_FOUND)
+    target_link_libraries(ncp_core PUBLIC SQLite::SQLite3)
+    target_compile_definitions(ncp_core PRIVATE HAVE_SQLITE)
+endif()
+
 find_package(unofficial-sodium CONFIG QUIET)
 if(unofficial-sodium_FOUND)
     message(STATUS "Found libsodium via vcpkg")
@@ -286,6 +328,16 @@ if(UNIX)
         target_link_libraries(ncp_core PUBLIC Threads::Threads)
     endif()
 
+    if(APPLE)
+        # license.cpp queries IOKit/CoreFoundation for hardware fingerprints.
+        find_library(IOKIT_FRAMEWORK IOKit REQUIRED)
+        find_library(COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+        target_link_libraries(ncp_core PUBLIC
+            ${IOKIT_FRAMEWORK}
+            ${COREFOUNDATION_FRAMEWORK}
+        )
+    endif()
+
 elseif(WIN32)
     # Windows: use Npcap SDK if available
     if(DEFINED NPCAP_SDK_DIR AND EXISTS "${NPCAP_SDK_DIR}/Include")
@@ -295,7 +347,9 @@ elseif(WIN32)
         else()
             target_link_directories(ncp_core PUBLIC "${NPCAP_SDK_DIR}/Lib")
         endif()
-        target_link_libraries(ncp_core PUBLIC wpcap Packet ws2_32)
+        # wpcap.dll is soft-loaded at runtime (ncp_pcap_dyn.cpp) — no import
+        # library: ncp.exe must start on systems without WinPcap/Npcap-compat.
+        target_link_libraries(ncp_core PUBLIC ws2_32)
         target_compile_definitions(ncp_core PUBLIC HAVE_PCAP)
         message(STATUS "Found Npcap SDK at ${NPCAP_SDK_DIR}")
     else()
@@ -303,7 +357,8 @@ elseif(WIN32)
     endif()
 
     # Windows networking libraries for hybrid backend (always needed)
-    target_link_libraries(ncp_core PUBLIC ws2_32 iphlpapi)
+    # winhttp: WinHttp* API used by network.cpp
+    target_link_libraries(ncp_core PUBLIC ws2_32 iphlpapi winhttp)
 
     # bcrypt.lib for CSPRNG in anti-TSPU modules
     target_link_libraries(ncp_core PUBLIC bcrypt)
@@ -340,8 +395,46 @@ if(WIN32)
         endif()
     endif()
 
-    # WFP library for legacy WFP backend
-    target_link_libraries(ncp_core PUBLIC fwpuclnt)
+    # WFP (Windows Filtering Platform) SDK detection.
+    # mingw-w64 (< v10) ships an incomplete fwpmu.h: no FWPM session/filter
+    # flags, no FWP_E_* codes and no built-in layer/condition GUIDs. We vendor
+    # complete mingw-w64 master headers plus an NCP compat block (verified
+    # Windows-SDK values) under deps/wfp-sdk-headers; GUID definitions live
+    # in src/ncp_wfp_guids.cpp because libfwpuclnt.a exports no GUID symbols.
+    set(NCP_WFP_HEADERS_DIR "${CMAKE_SOURCE_DIR}/deps/wfp-sdk-headers")
+    include(CheckCXXSourceCompiles)
+    set(_CMAKE_REQUIRED_INCLUDES_SAVE "${CMAKE_REQUIRED_INCLUDES}")
+    set(_CMAKE_REQUIRED_FLAGS_SAVE "${CMAKE_REQUIRED_FLAGS}")
+    # try_compile does not inherit add_definitions(): pass the project
+    # _WIN32_WINNT explicitly or mingw hides all WFP declarations and the
+    # check always fails.
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -D_WIN32_WINNT=0x0A00")
+    # Vendored mingw-w64 headers (system mingw-w64 9.3 set + NCP compat
+    # block with SDK-verified flags/GUIDs) are a MinGW fallback ONLY.
+    # MSVC ships a complete fwpmu.h in the Windows SDK.
+    set(_NCP_USE_VENDORED_WFP OFF)
+    if(NOT MSVC AND EXISTS "${NCP_WFP_HEADERS_DIR}/fwpmu.h")
+        set(CMAKE_REQUIRED_INCLUDES "${NCP_WFP_HEADERS_DIR}")
+        set(_NCP_USE_VENDORED_WFP ON)
+    endif()
+    check_cxx_source_compiles("
+#include <winsock2.h>
+#include <windows.h>
+#include <fwpmu.h>
+int main() { return (int)FWPM_SESSION_FLAG_DYNAMIC + (int)FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT + (int)FWP_E_ALREADY_EXISTS; }
+" HAVE_WFP_SDK)
+    set(CMAKE_REQUIRED_INCLUDES "${_CMAKE_REQUIRED_INCLUDES_SAVE}")
+    set(CMAKE_REQUIRED_FLAGS "${_CMAKE_REQUIRED_FLAGS_SAVE}")
+    if(HAVE_WFP_SDK)
+        if(_NCP_USE_VENDORED_WFP)
+            target_include_directories(ncp_core PUBLIC "${NCP_WFP_HEADERS_DIR}")
+        endif()
+        target_link_libraries(ncp_core PUBLIC fwpuclnt)
+        message(STATUS "WFP enabled (vendored headers: ${NCP_WFP_HEADERS_DIR})")
+    else()
+        target_compile_definitions(ncp_core PRIVATE NCP_NO_WFP)
+        message(STATUS "WFP SDK unavailable - WFP code disabled (WinDivert backend only)")
+    endif()
 endif()
 
 # ==================== Optional: libnetfilter_queue ====================
@@ -401,7 +494,7 @@ set_target_properties(ncp_core PROPERTIES
 # ==================== Required: OpenSSL ====================
 find_package(OpenSSL REQUIRED)
 if(OpenSSL_FOUND)
-    target_link_libraries(ncp_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(ncp_core PUBLIC OpenSSL::SSL OpenSSL::Crypto ${CMAKE_DL_LIBS})
     target_compile_definitions(ncp_core PRIVATE HAVE_OPENSSL)
     message(STATUS "Found OpenSSL: ${OPENSSL_VERSION}")
     

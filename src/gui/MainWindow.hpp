@@ -6,19 +6,17 @@
 #include <QTimer>
 #include <memory>
 
-// Optional QtWebEngine support: use QWebEngineView if available,
-// fall back to QTextBrowser (hyperlink viewer) otherwise.
-#ifdef HAVE_QTWEBENGINE
-#include <QWebEngineView>
-#endif
-#include <QTextBrowser>  // always available as fallback
+#include "ProxyController.hpp"
+#include "DriverController.hpp"
 
-// Forward declarations
 namespace ncp {
     class Crypto;
     class License;
     class Database;
-    class Network;
+    namespace DPI {
+        class IdentityRotation;
+        class AdvancedDPIBypass;
+    }
 }
 
 class StatusPanel;
@@ -29,24 +27,42 @@ class SystemStats;
 class ActivityLog;
 class LicenseInfo;
 class SettingsDialog;
+class ModulesPanel;
+class LeakTestPanel;
+// PR #118 tool panels (header-only widgets)
+class CryptoPanel;
+class IdentityPanel;
+class DPIMetricsPanel;
+class DPIStrategyEditor;
+class DnsLookupPanel;
+class UrlProbePanel;
+class SiteScraperPanel;
+class PollerEngine;
+class PollerPanel;
+class EnterprisePanel;
 
 namespace ncp::GUI {
 
 /**
- * @brief Main application window for Network Control Protocol
- * 
- * Implements a modern dark-themed dashboard with:
- * - Status panel with connection info
- * - Network flow monitoring
- * - DPI bypass controls
- * - Traffic analytics
- * - System statistics
- * - Activity logging
+ * @brief Main application window for Network Control Protocol (Qt6).
  *
- * The central widget hosts the web UI served at localhost:8080.
- * When HAVE_QTWEBENGINE is defined, a QWebEngineView loads the URL
- * directly; otherwise a QTextBrowser is shown as a thin launcher
- * with a clickable link.
+ * Native dashboard driving the external ncp.exe process via
+ * ProxyController / DriverController:
+ *  - Status panel with protection state + start/stop
+ *  - DPI bypass strategy controls (proxy mode + driver mode)
+ *  - Live network monitor + traffic chart
+ *  - System stats, activity log, license panel
+ *  - Modules panel + leak test
+ *  - Managed Tor (obfs4/Snowflake bridges) via SettingsDialog
+ *  - Interface menu: switch to Web UI (ncp-gui.exe) / reset launcher choice
+ *
+ * Merged with PR #118 (upstream Qt GUI): adds the advanced tool tabs
+ * (DPI metrics/strategy, Identity rotation, DNS/URL/Site-Scraper tools,
+ * Poller, Crypto), onboarding wizard, themes, profiles, diagnostics and
+ * activity-log export. Those panels are backed by in-process core objects
+ * (Crypto/Database/IdentityRotation/AdvancedDPIBypass) that are
+ * instantiated for the panels but never start packet processing here —
+ * the privacy-critical packet path stays in the external ncp.exe process.
  */
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -55,34 +71,29 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
 
-    // Prevent copying
     MainWindow(const MainWindow&) = delete;
     MainWindow& operator=(const MainWindow&) = delete;
 
 public slots:
-    // Connection control
     void onConnectClicked();
     void onDisconnectClicked();
     void onQuickConnectClicked();
-    
-    // DPI Bypass control
     void onBypassToggled(bool enabled);
     void onBypassTechniqueChanged(int index);
-    
-    // Settings
     void onSettingsClicked();
+    void onUiSettingsClicked();
     void onThemeChanged(const QString& theme);
-    
-    // System tray
     void onTrayIconActivated(QSystemTrayIcon::ActivationReason reason);
     void onMinimizeToTray();
-    
-    // License
     void onLicenseActivate();
     void onLicenseDeactivate();
-    
-    // Updates
     void onCheckForUpdates();
+    void onOpenWebUi();
+    void onChooseUiNextTime();
+    void onDriverStartClicked();
+    void onDriverStopClicked();
+    void onRunDiagnostics();
+    void onExportLogs();
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -90,59 +101,81 @@ protected:
 
 private slots:
     void updateStats();
-    void updateNetworkFlow();
-    void updateActivityLog();
-    void refreshLicenseStatus();
+    void onStartFinished(bool ok, const QString& message);
+    void appendLog(const QString& line);
+    void onDriverLine(const QString& line);
+    void onDriverModuleStatus(const QString& module, int state);
+    void onDriverFailed(const QString& reason);
+    void onDriverFinished(int exitCode);
 
 private:
     void setupUI();
     void setupMenuBar();
     void setupToolBar();
     void setupStatusBar();
-    void setupCentralWidget();  ///< Creates web-UI wrapper (QWebEngineView or QTextBrowser)
     void setupSystemTray();
     void setupConnections();
     void loadSettings();
     void saveSettings();
     void applyTheme(const QString& themeName);
-    QString loadStyleSheet(const QString& themeName);
+    GuiProxyConfig collectConfig() const;
+    void persistConfig(const GuiProxyConfig& cfg);
+    /// Tray notification if the tray is visible, status-bar fallback otherwise.
+    void notify(const QString& title, const QString& body);
+    /// Best-effort refresh of the license panel from the core License object.
+    void refreshLicenseStatus();
 
-    // Core modules
-    std::unique_ptr<ncp::Crypto> crypto_;
+    // Core (license drives the license panel; best-effort)
     std::unique_ptr<ncp::License> license_;
+
+    // PR #118: in-process core modules backing the advanced tool panels.
+    // Instantiated for the panels only; never started for packet processing
+    // in this process (that is the external ncp.exe's job).
+    std::unique_ptr<ncp::Crypto> crypto_;
     std::unique_ptr<ncp::Database> database_;
-    std::unique_ptr<ncp::Network> network_;
+    std::unique_ptr<ncp::DPI::IdentityRotation> identityRotation_;
+    std::unique_ptr<ncp::DPI::AdvancedDPIBypass> advancedDpi_;
 
-    // UI Components
-    QStackedWidget* stackedWidget_;
-    StatusPanel* statusPanel_;
-    NetworkMonitor* networkMonitor_;
-    DPIControl* dpiControl_;
-    TrafficAnalytics* trafficAnalytics_;
-    SystemStats* systemStats_;
-    ActivityLog* activityLog_;
-    LicenseInfo* licenseInfo_;
-    SettingsDialog* settingsDialog_;
+    ProxyController* controller_ = nullptr;   // child of this
+    DriverController* driver_ = nullptr;      // ncp.exe run (driver mode)
 
-    // Web UI central widget (thin wrapper around localhost:8080)
-    // Exactly one of these is non-null, depending on compile-time availability.
-#ifdef HAVE_QTWEBENGINE
-    QWebEngineView* webView_ = nullptr;   ///< QWebEngineView (preferred)
-#endif
-    QTextBrowser*   textBrowser_ = nullptr; ///< QTextBrowser fallback
+    // UI Components (base app)
+    StatusPanel* statusPanel_ = nullptr;
+    NetworkMonitor* networkMonitor_ = nullptr;
+    DPIControl* dpiControl_ = nullptr;
+    TrafficAnalytics* trafficAnalytics_ = nullptr;
+    SystemStats* systemStats_ = nullptr;
+    ActivityLog* activityLog_ = nullptr;
+    LicenseInfo* licenseInfo_ = nullptr;
+    ModulesPanel* modulesPanel_ = nullptr;
+    LeakTestPanel* leakTestPanel_ = nullptr;
 
-    // System tray
-    QSystemTrayIcon* trayIcon_;
-    QMenu* trayMenu_;
+    // UI Components (PR #118 tool tabs)
+    CryptoPanel* cryptoPanel_ = nullptr;
+    IdentityPanel* identityPanel_ = nullptr;
+    DPIMetricsPanel* dpiMetricsPanel_ = nullptr;
+    DPIStrategyEditor* dpiStrategyEditor_ = nullptr;
+    DnsLookupPanel* dnsLookupPanel_ = nullptr;
+    UrlProbePanel* urlProbePanel_ = nullptr;
+    SiteScraperPanel* siteScraperPanel_ = nullptr;
+    PollerPanel* pollerPanel_ = nullptr;
+    std::unique_ptr<PollerEngine> pollerEngine_;
+    // Enterprise tab: CLI enterprise modules (spa/reality/stegodns/porthop/
+    // fog/xdp). Unconditional — needs only the external ncp CLI and the
+    // linked ncp_core (in-process stegodns), no core runtime objects.
+    EnterprisePanel* enterprisePanel_ = nullptr;
+
+    // System tray (nullptr when tray unavailable — e.g. RDP session)
+    QSystemTrayIcon* trayIcon_ = nullptr;
+    QMenu* trayMenu_ = nullptr;
 
     // Timers
-    QTimer* statsTimer_;
-    QTimer* networkTimer_;
-    QTimer* logTimer_;
+    QTimer* statsTimer_ = nullptr;
 
     // State
-    bool isConnected_;
-    bool bypassEnabled_;
+    bool isConnected_ = false;
+    bool bypassEnabled_ = true;
+    bool quitRequested_ = false;
     QString currentTheme_;
 };
 

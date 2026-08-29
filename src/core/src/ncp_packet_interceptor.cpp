@@ -6,10 +6,6 @@
 #include <sodium.h>
 
 #ifdef __linux__
-#ifdef HAVE_NFQUEUE
-#include <libnetfilter_queue/libnetfilter_queue.h>
-#include <linux/netfilter.h>
-#endif
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -18,9 +14,20 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <fcntl.h>
+// NFQUEUE/kernel headers AFTER glibc netinet/*: libc-compat.h then
+// suppresses duplicate in_addr/IPPROTO_* definitions (order conflict fix).
+#ifdef HAVE_NFQUEUE
+#include <libnetfilter_queue/libnetfilter_queue.h>
+#include <linux/netfilter.h>
+#endif
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/ioctl.h>
+#elif defined(__APPLE__)
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #elif defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -85,8 +92,12 @@ struct VXLANHeader {
 
 static_assert(sizeof(VXLANHeader) == 8, "VXLANHeader must be exactly 8 bytes per RFC 7348");
 
+#ifndef IPPROTO_GRE
 static constexpr uint8_t IPPROTO_GRE = 47;
+#endif
+#ifndef IPPROTO_IPIP
 static constexpr uint8_t IPPROTO_IPIP = 4;
+#endif
 static constexpr uint16_t VXLAN_PORT = 4789;
 static constexpr uint16_t GRE_PROTO_IPV4 = 0x0800;
 
@@ -204,6 +215,7 @@ public:
 // ==================== NFQUEUE Backend (Linux) ====================
 
 class NFQUEUEBackend : public PacketInterceptor::Impl {
+    using Config = PacketInterceptor::Config;
 public:
     NFQUEUEBackend() = default;
     ~NFQUEUEBackend() override { stop(); }
@@ -533,7 +545,7 @@ private:
 };
 #endif // _WIN32 && HAVE_WINDIVERT
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NCP_NO_WFP)
 // ==================== WFP Backend (Windows) ====================
 // Uses Windows Filtering Platform for network-layer filter management.
 //
@@ -839,12 +851,16 @@ private:
 PacketInterceptor::PacketInterceptor() = default;
 PacketInterceptor::~PacketInterceptor() { stop(); }
 
+bool PacketInterceptor::initialize() { return initialize(Config{}); }
+
 bool PacketInterceptor::initialize(const Config& config) {
     if (initialized_.load()) return false;
 
-    std::lock_guard<std::mutex> lock(config_mutex_);
-    config_ = config;
-    config_version_++;  // FIX #30: bump version on init
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        config_ = config;
+        config_version_++;  // FIX #30: bump version on init
+    } // lock released: log() and backend->initialize() take config_mutex_ internally
 
     Backend backend = config.backend;
     if (backend == Backend::AUTO) {
@@ -890,7 +906,7 @@ bool PacketInterceptor::initialize(const Config& config) {
     }
 #endif
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NCP_NO_WFP)
     if (backend == Backend::WFP) {
         impl_ = std::make_unique<WFPBackend>();
         impl_->parent = this;

@@ -34,6 +34,23 @@ option(ENABLE_DOCS "Generate Doxygen documentation" OFF)
 option(ENABLE_LIBOQS "Enable post-quantum cryptography via liboqs" OFF)
 option(ENABLE_TOR_PROXY "Enable Tor proxy support" OFF)
 option(ENABLE_FUZZING "Enable fuzzing tests (requires Clang with LibFuzzer)" OFF)
+option(BUILD_PORTABLE_MACOS "Build a relocatable macOS layout (bin/ + lib/ with bundled dylibs)" OFF)
+
+# ==================== Portable macOS layout ====================
+# When BUILD_PORTABLE_MACOS=ON, the install tree is laid out so the binary
+# in bin/ resolves dylibs from a sibling lib/ via @loader_path. The actual
+# dylib copy + install-name rewriting is done post-build by
+# scripts/build_macos_portable.sh (see bundle_dylibs in that script).
+if(BUILD_PORTABLE_MACOS)
+    if(NOT APPLE)
+        message(FATAL_ERROR "BUILD_PORTABLE_MACOS only applies on macOS")
+    endif()
+    set(CMAKE_MACOSX_RPATH ON)
+    set(CMAKE_INSTALL_RPATH "@loader_path/../lib")
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+    set(CMAKE_INSTALL_NAME_DIR "@rpath")
+    message(STATUS "Portable macOS layout enabled (rpath: @loader_path/../lib)")
+endif()
 
 # ==================== Platform-specific Settings ====================
 if(WIN32)
@@ -187,7 +204,12 @@ if(ENABLE_GUI)
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTORCC ON)
     set(CMAKE_AUTOUIC ON)
-    find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Charts)
+    # QT_MINGW_ROOT: prefix of the Qt6 installation (e.g. /opt/Qt/6.5.3/mingw_64).
+    # PATHS is used explicitly because the MinGW toolchain re-roots
+    # CMAKE_PREFIX_PATH, which breaks the normal config-package search.
+    set(QT_MINGW_ROOT "" CACHE PATH "Qt6 installation prefix")
+    find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Charts
+                 PATHS ${QT_MINGW_ROOT})
 endif()
 
 # ==================== Output Directories ====================
@@ -260,6 +282,14 @@ endif()
 # Uses vcpkg's libwebsockets-config.cmake (CONFIG mode required)
 
 find_package(libwebsockets CONFIG QUIET)
+# Linux distro packages ship LibwebsocketsConfig.cmake (capital L)
+if(NOT libwebsockets_FOUND)
+    find_package(Libwebsockets CONFIG QUIET)
+    if(Libwebsockets_FOUND)
+        set(libwebsockets_FOUND TRUE)
+        message(STATUS "libwebsockets found via distro config (LibwebsocketsConfig.cmake)")
+    endif()
+endif()
 
 if(libwebsockets_FOUND)
     add_definitions(-DHAVE_LIBWEBSOCKETS)
@@ -314,7 +344,6 @@ endif()
 
 if(ENABLE_GUI)
     add_subdirectory(src/gui)
-    add_subdirectory(src)
 endif()
 
 if(ENABLE_TESTS)
@@ -366,8 +395,9 @@ if(ENABLE_CLI)
 endif()
 
 if(ENABLE_GUI)
-    install(TARGETS ncp
+    install(TARGETS ncp-qt
         RUNTIME DESTINATION bin
+        BUNDLE DESTINATION .
     )
 endif()
 
@@ -381,4 +411,17 @@ if(ENABLE_DOCS AND DOXYGEN_FOUND)
         DESTINATION share/doc/ncp
         OPTIONAL
     )
+endif()
+
+# ==================== CPack (portable artifacts) ====================
+if(BUILD_PORTABLE_MACOS)
+    set(CPACK_PACKAGE_NAME "Dynam")
+    set(CPACK_PACKAGE_VENDOR "NCP Project")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
+    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_FILE_NAME "Dynam-${PROJECT_VERSION}-macos-${CMAKE_SYSTEM_PROCESSOR}")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+    set(CPACK_GENERATOR "TGZ;DragNDrop")
+    set(CPACK_DMG_VOLUME_NAME "Dynam ${PROJECT_VERSION}")
+    include(CPack)
 endif()

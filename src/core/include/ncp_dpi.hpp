@@ -61,6 +61,10 @@ struct DPIConfig {
     bool enable_tcp_split = true;
     int split_position = 2;
     bool split_at_sni = true;
+    // Split in the middle of the second-level domain of the SNI/Host
+    // (zapret "midsld") — the split that actually defeats per-packet SNI
+    // string matching; without it the hostname stays whole in one segment.
+    bool split_at_midsld = false;
 
     bool enable_noise = true;
     int noise_size = 64;
@@ -114,9 +118,29 @@ struct DPIConfig {
     bool enable_adaptive_fragmentation = true;  // Adapt fragmentation based on detection
     int max_fragment_retries = 3;  // Max retries before changing strategy
 
+    // Kill switch (DRIVER/WinDivert mode only): drop ALL direct outbound
+    // TCP/UDP that bypasses NCP — if the proxy/Tor chain goes down, traffic
+    // cannot silently leak direct. NEVER enabled by default; requires an
+    // explicit opt-in flag (--kill-switch). Exemptions are loopback (local
+    // proxy/Tor), DNS udp/53 (owned by the DNS leak prevention hooks) and
+    // DHCP; an optional allow endpoint can be configured for the upstream.
+    bool kill_switch = false;
+    std::string kill_switch_allow_host;    // e.g. upstream proxy IP (optional)
+    uint16_t kill_switch_allow_port = 0;   // e.g. 9050
+
     // Reverse fragment order (send second fragment first, then first)
     // Mimics GoodbyeDPI --reverse-frag; effective on Beeline and some TSPU
     bool enable_reverse_frag = false;
+
+    // Selective desync (v1.6.0, winws2-style --hostlist/--hostlist-exclude/
+    // --ipset). Empty = feature off: every intercepted TLS ClientHello gets
+    // desynced (legacy behaviour). With a hostlist active, only listed domains
+    // (SNI suffix match) — or destination IPs from the ipset — are desynced;
+    // everything else passes through untouched. This is what makes zapret
+    // practical: games, banking and gov sites stay on the clean path.
+    std::string hostlist_file;          // include mode: desync ONLY these
+    std::string hostlist_exclude_file;  // exclude mode: desync all EXCEPT these
+    std::string ipset_file;             // CIDR / plain-IP list for dst-IP filter
 
     // Auto-TTL: automatically determine fake TTL based on incoming packets
     // Uses incoming TTL to estimate hop count: fake_ttl = path_hops + autottl_delta
@@ -131,6 +155,10 @@ struct DPIConfig {
     int autottl_delta = 1;       // delta added to estimated path hops (can be negative)
     int autottl_min = 3;         // minimum auto-detected TTL
     int autottl_max = 20;        // maximum auto-detected TTL
+
+    // QUIC/HTTP3 handling (UDP 443) — packet-level backends (WinDivert).
+    bool quic_force_tcp = false;   // drop outbound QUIC → clients fall back to TCP/TLS
+    int quic_ipfrag_offset = 0;    // >0: IP-fragment QUIC Initial at this payload offset
 
     // Auto-probe: sequentially try preset strategies until one works
     bool enable_autoprobe = false;
@@ -190,6 +218,7 @@ struct DPIConfig {
                enable_tcp_split == other.enable_tcp_split &&
                split_position == other.split_position &&
                split_at_sni == other.split_at_sni &&
+               split_at_midsld == other.split_at_midsld &&
                enable_noise == other.enable_noise &&
                noise_size == other.noise_size &&
                enable_host_case == other.enable_host_case &&
@@ -459,6 +488,11 @@ using ConfigChangeCallback = std::function<void(const DPIConfig&, const DPIConfi
 using TransformCallback = std::function<std::vector<uint8_t>(
     const std::vector<uint8_t>& payload)>;
 
+// Builds the WinDivert filter string used by the kill switch. Pure string
+// logic, compiled on all platforms so unit tests can verify it.
+std::string build_kill_switch_filter(const std::string& allow_host,
+                                     uint16_t allow_port);
+
 struct DPIStats {
     std::atomic<uint64_t> packets_total{0};
     std::atomic<uint64_t> packets_modified{0};
@@ -469,6 +503,8 @@ struct DPIStats {
     std::atomic<uint64_t> connections_handled{0};
     // CRIT-1: count WinDivertSend failures
     std::atomic<uint64_t> send_errors{0};
+    // QUIC force-TCP: outbound QUIC datagrams intentionally dropped
+    std::atomic<uint64_t> packets_dropped{0};
 
         DPIStats() = default;
     DPIStats(const DPIStats& other)
@@ -479,7 +515,8 @@ struct DPIStats {
           bytes_sent(other.bytes_sent.load()),
           bytes_received(other.bytes_received.load()),
           connections_handled(other.connections_handled.load()),
-          send_errors(other.send_errors.load()) {}
+          send_errors(other.send_errors.load()),
+          packets_dropped(other.packets_dropped.load()) {}
     DPIStats& operator=(const DPIStats& other) {
         if (this != &other) {
             packets_total.store(other.packets_total.load());
@@ -490,6 +527,7 @@ struct DPIStats {
             bytes_received.store(other.bytes_received.load());
             connections_handled.store(other.connections_handled.load());
             send_errors.store(other.send_errors.load());
+            packets_dropped.store(other.packets_dropped.load());
         }
         return *this;
     }
@@ -503,6 +541,7 @@ struct DPIStats {
         bytes_received.store(0);
         connections_handled.store(0);
         send_errors.store(0);
+        packets_dropped.store(0);
     }
 
     DPIStats snapshot() const noexcept {
@@ -515,6 +554,7 @@ struct DPIStats {
         s.bytes_received.store(bytes_received.load());
         s.connections_handled.store(connections_handled.load());
         s.send_errors.store(send_errors.load());
+        s.packets_dropped.store(packets_dropped.load());
         return s;
     }
 };
@@ -550,6 +590,10 @@ public:
     void stop();
     void shutdown();
     bool is_running() const;
+    /// True only when a real interception backend is processing packets
+    /// (nfqueue / WinDivert / TCP proxy / WS tunnel). False in passive mode,
+    /// where start() succeeds but NO traffic is touched.
+    bool interception_active() const;
 
     DPIConfig get_config() const;
     bool update_config(const DPIConfig& config);

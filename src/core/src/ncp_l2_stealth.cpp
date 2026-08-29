@@ -20,6 +20,7 @@
 #include <pcap/pcap.h>
 #elif defined(_WIN32)
 #include <pcap.h>
+#include "ncp_pcap_dyn.hpp"  // soft-load wpcap.dll at runtime (no import lib)
 #endif
 #endif
 
@@ -497,8 +498,10 @@ L2Stealth::~L2Stealth() {
 bool L2Stealth::initialize(const Config& config) {
     if (initialized_.load(std::memory_order_acquire)) return false;
 
-    std::lock_guard<std::mutex> lock(config_mutex_);
-    config_ = config;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        config_ = config;
+    } // lock released: impl_->initialize() and log() must not run under config_mutex_
 
     if (!impl_->initialize(config)) {
         return false;
@@ -578,7 +581,9 @@ bool L2Stealth::is_ebtables_available() {
 }
 
 bool L2Stealth::is_pcap_available() {
-#ifdef HAVE_PCAP
+#if defined(_WIN32) && defined(HAVE_PCAP)
+    return pcapdyn::available();  // runtime: wpcap.dll may be absent
+#elif defined(HAVE_PCAP)
     return true;
 #else
     return false;

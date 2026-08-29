@@ -19,32 +19,63 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential libpcap-dev
-          sudo apt-get install -y qt6-base-dev qt6-charts-dev
-          pip install conan
-          
-      - name: Setup Conan
-        run: |
-          conan profile detect
-          conan install . --build=missing -of=build
-          
+          # archive.ubuntu.com is occasionally degraded on GH runners:
+          # Acquire timeouts do NOT kill a trickling connection, so wrap
+          # every apt invocation in a hard `timeout` and retry the whole
+          # update+install transaction.
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::ForceIPv4=true"
+          ok=0
+          for i in 1 2 3 4 5; do
+            sudo apt-get clean
+            sudo timeout 180 apt-get $APT_OPTS update && \
+            sudo timeout 600 apt-get $APT_OPTS install -y --no-install-recommends \
+              cmake build-essential pkg-config \
+              libpcap-dev libssl-dev libsodium-dev libwebsockets-dev \
+              qt6-base-dev qt6-charts-dev && { ok=1; break; } || \
+              { echo "apt attempt $i failed, retrying in 15s..."; sleep 15; }
+          done
+          [ "$ok" = 1 ] || { echo "apt failed after 5 attempts"; exit 1; }
+
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DENABLE_GUI=ON
-        
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DENABLE_GUI=ON -DENABLE_TESTS=OFF
+
       - name: Build
         run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
-        
-      - name: Package
+
+      - name: Stamp web UI build id (git sha)
+        run: sed -i.bak "s/__NCP_BUILD_STAMP__/${GITHUB_SHA:0:7}/" web/server.py && rm -f web/server.py.bak
+
+      - name: Package (CLI + Qt GUI + Web UI, bundled shared libs)
         run: |
-          mkdir -p release/ncp-linux-x64
-          cp build/bin/ncp release/ncp-linux-x64/
-          cp README.md LICENSE release/ncp-linux-x64/
+          set -e
+          pkg=release/ncp-linux-x64
+          mkdir -p $pkg/lib
+          cp build/bin/ncp $pkg/ncp.bin
+          cp build/bin/ncp-qt $pkg/ncp-qt.bin
+          cp -r web $pkg/
+          cp README.md LICENSE $pkg/
+          cp packaging/start-webui.sh $pkg/
+          chmod +x $pkg/start-webui.sh
+          # Bundle every non-baseline shared lib both binaries need
+          # (libwebsockets/openssl3/libsodium/libpcap/Qt are NOT present
+          # on a stock user system; glibc/libstdc++/libgcc stay system).
+          for bin in build/bin/ncp build/bin/ncp-qt; do
+            ldd $bin | awk '/=> \//{print $3}' | while read -r lib; do
+              case "$lib" in
+                *libc.so*|*libm.so*|*libmvec*|*libpthread*|*libdl*|*librt*|*ld-linux*|*libresolv*|*libstdc++*|*libgcc_s*) ;;
+                *) cp -L "$lib" $pkg/lib/ || true ;;
+              esac
+            done
+          done
+          # $ORIGIN wrappers so binaries find bundled libs without env setup
+          printf '%s\n' '#!/bin/sh'             'DIR="$(cd "$(dirname "$0")" && pwd)"'             'LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$DIR/ncp.bin" "$@"'             > $pkg/ncp
+          printf '%s\n' '#!/bin/sh'             'DIR="$(cd "$(dirname "$0")" && pwd)"'             'LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$DIR/ncp-qt.bin" "$@"'             > $pkg/ncp-qt
+          chmod +x $pkg/ncp $pkg/ncp-qt
           tar -czvf ncp-linux-x64.tar.gz -C release ncp-linux-x64
-          
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -55,29 +86,33 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install dependencies
         run: |
-          brew install cmake conan qt@6 libpcap
-          
-      - name: Setup Conan
-        run: |
-          conan profile detect
-          conan install . --build=missing -of=build
-          
-      - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DENABLE_GUI=ON
-        
-      - name: Build
-        run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
-        
-      - name: Package
+          brew update
+          brew install cmake libsodium libwebsockets spdlog qt@6 fmt
+
+      - name: Build Dynam.app (Qt GUI + embedded CLI) via proven script
+        run: ./scripts/build_macos_gui_app.sh
+
+      - name: Stamp web UI build id (git sha)
+        run: sed -i.bak "s/__NCP_BUILD_STAMP__/${GITHUB_SHA:0:7}/" web/server.py && rm -f web/server.py.bak
+
+      - name: Package (Dynam.app + CLI + Web UI)
         run: |
           mkdir -p release/ncp-macos-x64
-          cp build/bin/ncp release/ncp-macos-x64/
+          ditto --noextattr --norsrc dist/Dynam.app release/ncp-macos-x64/Dynam.app
+          # Standalone `ncp` entry point: the CLI inside Dynam.app is built
+          # with BUILD_PORTABLE_MACOS and resolves its dylibs from the app
+          # itself, so the top-level ncp is a thin wrapper into the bundle.
+          printf '%s\n' '#!/bin/sh'             'DIR="$(cd "$(dirname "$0")" && pwd)"'             'exec "$DIR/Dynam.app/Contents/Resources/bin/ncp" "$@"'             > release/ncp-macos-x64/ncp
+          chmod +x release/ncp-macos-x64/ncp
+          cp -r web release/ncp-macos-x64/
           cp README.md LICENSE release/ncp-macos-x64/
+          cp packaging/start-webui.sh release/ncp-macos-x64/
+          chmod +x release/ncp-macos-x64/start-webui.sh
           tar -czvf ncp-macos-x64.tar.gz -C release ncp-macos-x64
-          
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -88,35 +123,101 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Qt
         uses: jurplel/install-qt-action@v3
         with:
-          version: '6.6.0'
+          # 6.8 LTS: Qt 6.6.0 headers reference stdext::checked-array
+          # iterators that VS2026's STL removed (error C2065/C3861 in
+          # qvarlengtharray.h). 6.8 supports current MSVC toolchains.
+          version: '6.8.3'
+          arch: 'win64_msvc2022_64'  # Qt 6.8 dropped the msvc2019_64 arch
           modules: 'qtcharts'
-          
-      - name: Install Conan
-        run: pip install conan
-        
-      - name: Setup Conan
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          # Static key on purpose: vcpkg package set is pinned by the install
+          # step below, not by this workflow file — editing release.yml must
+          # not bust the (expensive, ~20 min from-source) dependency cache.
+          key: vcpkg-release-deps-x64-windows-v1
+
+      - name: Install vcpkg and dependencies
+        shell: cmd
         run: |
-          conan profile detect
-          conan install . --build=missing -of=build
-          
+          if not exist C:\vcpkg\vcpkg.exe (
+            git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+            C:\vcpkg\bootstrap-vcpkg.bat
+          )
+          C:\vcpkg\vcpkg install libsodium:x64-windows libwebsockets:x64-windows openssl:x64-windows
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Configure CMake
-        run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DENABLE_GUI=ON
-        
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
+            -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+            -DENABLE_GUI=ON -DENABLE_TESTS=OFF
+
       - name: Build
         run: cmake --build build --config ${{env.BUILD_TYPE}}
-        
-      - name: Package
+
+      - name: Stamp web UI build id (git sha)
+        shell: pwsh
         run: |
-          mkdir release\ncp-windows-x64
-          copy build\bin\Release\ncp.exe release\ncp-windows-x64\
-          copy README.md release\ncp-windows-x64\
-          copy LICENSE release\ncp-windows-x64\
-          Compress-Archive -Path release\ncp-windows-x64 -DestinationPath ncp-windows-x64.zip
-          
+          $sha = $env:GITHUB_SHA.Substring(0,7)
+          [IO.File]::WriteAllText("web\server.py", ((Get-Content web\server.py -Raw) -replace "__NCP_BUILD_STAMP__", $sha))
+
+      - name: Build ncp-gui.exe (frozen Web UI launcher)
+        shell: pwsh
+        run: |
+          # ncp-gui.exe = web UI frozen with PyInstaller. The Qt launcher,
+          # WINDOWS-NOTES.txt and web/server.py all expect it next to ncp.exe.
+          # --uac-admin: server.py starts ncp.exe (requireAdministrator) via
+          # subprocess.Popen - CreateProcess cannot elevate (WinError 740),
+          # so the launcher itself must run elevated; UAC prompts once.
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r web\requirements.txt
+          pyinstaller --noconfirm --clean --onefile --name ncp-gui --uac-admin `
+            --icon resources\Dynam.ico `
+            --paths web `
+            --add-data "web/static;static" `
+            --hidden-import ncp_license --hidden-import ncp_keygen `
+            --hidden-import bypass_routes --hidden-import enterprise_routes `
+            --hidden-import ncp_tray `
+            --hidden-import engineio.async_drivers.threading `
+            web\server.py
+
+      - name: Package (CLI + Qt GUI + Web UI + runtime DLLs)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release\ncp-windows-x64 -Force | Out-Null
+          Copy-Item build\bin\Release\ncp.exe release\ncp-windows-x64\
+          Copy-Item build\bin\Release\ncp-qt.exe release\ncp-windows-x64\
+          Copy-Item dist\ncp-gui.exe release\ncp-windows-x64\
+          Copy-Item README.md, LICENSE release\ncp-windows-x64\
+          Copy-Item -Recurse web release\ncp-windows-x64\web
+          windeployqt --release --no-translations release\ncp-windows-x64\ncp-qt.exe
+          Copy-Item C:\vcpkg\installed\x64-windows\bin\*.dll release\ncp-windows-x64\
+          # WinDivert driver files: CMake post-build already placed them next
+          # to ncp.exe (deps/WinDivert auto-detected). Fall back to the repo
+          # copy so the package NEVER ships without the interception driver -
+          # without WinDivert.dll/WinDivert64.sys the bypass silently fails.
+          $wd = 'build\bin\Release'
+          if (-not (Test-Path "$wd\WinDivert.dll")) { $wd = 'deps\WinDivert\x64' }
+          Copy-Item "$wd\WinDivert.dll" release\ncp-windows-x64\
+          Copy-Item "$wd\WinDivert64.sys" release\ncp-windows-x64\
+          Copy-Item deps\WinDivert\LICENSE release\ncp-windows-x64\WinDivert-LICENSE.txt
+          # Web UI launcher + Windows quick-start notes
+          Copy-Item packaging\start-webui.bat release\ncp-windows-x64\
+          Copy-Item packaging\WINDOWS-NOTES.txt release\ncp-windows-x64\
+          Compress-Archive -Path release\ncp-windows-x64 -DestinationPath ncp-windows-x64.zip -Force
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -127,17 +228,32 @@ jobs:
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write  # required to create the GitHub Release (fixes 403)
+    env:
+      NCP_SIGNING_KEY: ${{ secrets.NCP_SIGNING_KEY }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-        
+
+      - name: Generate signed update manifest
+        if: ${{ env.NCP_SIGNING_KEY != '' }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 web/ncp_update.py manifest "${TAG#v}" "$TAG" --key-env NCP_SIGNING_KEY \
+            ncp-windows-x64/ncp-windows-x64.zip ncp-linux-x64/ncp-linux-x64.tar.gz > manifest.json
+          cat manifest.json
+
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             ncp-linux-x64/ncp-linux-x64.tar.gz
             ncp-macos-x64/ncp-macos-x64.tar.gz
             ncp-windows-x64/ncp-windows-x64.zip
+            manifest.json
+          fail_on_unmatched_files: false
           draft: false
           prerelease: false
         env:

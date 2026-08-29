@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import uuid
+import hashlib
 import platform
 import subprocess
 import threading
@@ -35,10 +36,94 @@ except ImportError:
 
 # Публичный ключ Ed25519 для верификации лицензий (Base64, 32 байта)
 # Этот ключ безопасно распространять — подделать подпись без приватного ключа невозможно
-NCP_LICENSE_PUBLIC_KEY_B64 = "0J6Gb+VIXPUPl9zAWF+DpHWZhPrLvGYl7g82lJAfrlE="
+# Ключевая пара перегенерирована 2026-08-01 (старый приватный ключ утерян).
+# Верификация ключей — web/ncp_license.py, выпуск ключей — web/ncp_keygen.py.
+NCP_LICENSE_PUBLIC_KEY_B64 = "FT2FWdlm6rGldWix5fDJBuZmrHIR+73CuRpWszs/Hog="
 
 # Файл для сохранения активированной лицензии
 LICENSE_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "ncp" / "license.json"
+
+# ── Пробный период (7 дней, автовыдача при первом запуске) ──────────────────
+TRIAL_DAYS = 7
+TRIAL_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "ncp" / "trial.json"
+TRIAL_SECRET = "ncp7d-tr14l-5ecr3t-k3y"  # anti-casual MAC key (same literal in C++)
+TRIAL_MODULES = [
+    "dpi_bypass", "e2e_encryption", "i2p", "geneva_basic", "geneva_full",
+    "self_test", "pipeline", "dns_leak", "session_frag", "cross_layer",
+    "rtt_equalizer", "volume_norm", "behavioral_cloak", "time_breaker",
+    "covert_channel", "wf_defense", "protocol_rotation", "as_router",
+    "geo_obfuscator",
+]
+
+
+def _machine_id() -> str:
+    """Стабильный идентификатор машины (hostname, lowercase) — тот же, что в C++."""
+    return (platform.node() or "unknown-host").strip().lower()
+
+
+def _trial_sig(first_run: str, expires: str, machine: str) -> str:
+    s = f"{TRIAL_SECRET}|{first_run}|{expires}|{machine}"
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _set_trial_state(expires: str, days_left: int):
+    state["license"].update({
+        "status": "trial",
+        "key": "",
+        "plan": "trial",
+        "plan_label": PLAN_LABELS.get("trial", "Trial"),
+        "expires": expires,
+        "days_remaining": days_left,
+        "modules": list(TRIAL_MODULES),
+        "features": list(TRIAL_MODULES),
+    })
+
+
+def _ensure_trial():
+    """При первом запуске выдаёт 7-дневный триал; при повторных — восстанавливает.
+
+    Настоящая лицензия (status=active) имеет приоритет. Триал хранится в
+    trial.json с MAC (sha256) и привязкой к hostname; подделка/перенос на
+    другую машину → отказ.
+    """
+    from datetime import date
+    if _is_license_active():
+        return
+    try:
+        today = date.today()
+        mach = _machine_id()
+        if TRIAL_FILE.exists():
+            d = json.loads(TRIAL_FILE.read_text(encoding="utf-8"))
+            fr = str(d.get("first_run", ""))
+            exp = str(d.get("expires", ""))
+            m0 = str(d.get("machine", "")).strip().lower()
+            sig = str(d.get("sig", ""))
+            if not fr or not exp or m0 != mach or sig != _trial_sig(fr, exp, m0):
+                state["license"]["status"] = "inactive"
+                push_log("WARN", "Trial state invalid or tampered — license required")
+                return
+            exp_d = datetime.strptime(exp, "%Y-%m-%d").date()
+            if today > exp_d:
+                state["license"]["status"] = "expired"
+                state["license"]["plan_label"] = "Триал истёк"
+                state["license"]["expires"] = exp
+                push_log("WARN", f"Trial period expired on {exp} — enter a license key")
+                return
+        else:
+            fr = today.strftime("%Y-%m-%d")
+            exp_d = today + timedelta(days=TRIAL_DAYS)
+            exp = exp_d.strftime("%Y-%m-%d")
+            TRIAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TRIAL_FILE.write_text(json.dumps({
+                "first_run": fr, "expires": exp, "machine": mach,
+                "sig": _trial_sig(fr, exp, mach),
+            }), encoding="utf-8")
+            push_log("INFO", f"Trial period activated: {TRIAL_DAYS} days (until {exp})")
+        _set_trial_state(exp, max(0, (exp_d - today).days))
+    except Exception as e:
+        logger.warning(f"Trial init failed: {e}")
+
+
 
 
 # ─── License gate helpers ────────────────────────────────────────────────────
@@ -46,7 +131,7 @@ LICENSE_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "ncp" / "lice
 def _is_license_active() -> bool:
     """Return True if a valid, non-expired license is loaded in state."""
     lic = state.get("license", {})
-    return lic.get("status") == "active"
+    return lic.get("status") in ("active", "trial")
 
 
 def _license_has_module(module_name: str) -> bool:
@@ -85,7 +170,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("ncp-web")
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
+# PyInstaller frozen support: bundled data (static/, ncp.exe) is extracted to
+# sys._MEIPASS at runtime; the launcher exe dir is where the user keeps
+# WinDivert.dll / WinDivert64.sys.
+FROZEN = getattr(sys, "frozen", False)
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+EXE_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).parent
+
+BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 BUILD_DIR = PROJECT_DIR / "build"
 
@@ -93,6 +185,8 @@ def _find_ncp_binary() -> Path:
     """Search for ncp binary in common build output locations."""
     if platform.system() == "Windows":
         candidates = [
+            RESOURCE_DIR / "ncp.exe",   # bundled inside frozen app
+            EXE_DIR / "ncp.exe",        # next to the launcher
             BUILD_DIR / "ncp.exe",
             BUILD_DIR / "bin" / "Release" / "ncp.exe",
             BUILD_DIR / "bin" / "Debug" / "ncp.exe",
@@ -111,18 +205,60 @@ def _find_ncp_binary() -> Path:
     # Return default path even if not found yet
     return candidates[0]
 
-NCP_BINARY = _find_ncp_binary()
+NCP_BINARY = _find_ncp_binary().resolve()
+
+# JSON со статистикой модулей, экспортируемой движком (--stats-file)
+ENGINE_STATS_FILE = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp") / "ncp_engine_stats.json"
 
 if platform.system() == "Windows":
     CONFIG_PATH = Path(os.environ.get("APPDATA", "")) / "ncp" / "config.json"
 else:
     CONFIG_PATH = Path("/etc/ncp/config.json")
 
-STATIC_DIR = BASE_DIR / "static"
+# Ensure the config directory exists from the start (health check reads it)
+try:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
+STATIC_DIR = (RESOURCE_DIR / "static") if FROZEN else (BASE_DIR / "static")
 LOG_BUFFER_SIZE = 500
 
 # ─── App & SocketIO ──────────────────────────────────────────────────────────
+# Заменяется CI на короткий SHA коммита при сборке релиза
+BUILD_STAMP = "__NCP_BUILD_STAMP__"
+
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
+
+# ── Local API protection ─────────────────────────────────────────────
+# Threat model: a website open in the user's browser can blind-POST to
+# http://127.0.0.1:<port>/api/* (CSRF) or use DNS rebinding to read
+# responses. Countermeasures:
+#   1. Per-start random token injected into the served page only — a
+#      cross-site page cannot read it (SOP) and cannot call the API.
+#   2. Host header must be loopback — defeats DNS-rebinding (the Host
+#      would be the attacker's domain).
+#   3. Cross-site Origin/Referer rejected.
+import secrets as _secrets
+_API_TOKEN = _secrets.token_hex(16)
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+@app.before_request
+def _api_guard():
+    if not request.path.startswith("/api/"):
+        return None
+    host = (request.host or "").split(":")[0].lower().strip("[]")
+    if host not in _LOOPBACK_HOSTS:
+        return jsonify({"ok": False, "error": "forbidden_host"}), 403
+    if request.headers.get("X-NCP-Token", "") != _API_TOKEN:
+        return jsonify({"ok": False, "error": "forbidden_token"}), 403
+    origin = (request.headers.get("Origin") or request.headers.get("Referer") or "")
+    if origin:
+        ohost = origin.split("://", 1)[-1].split("/")[0].split(":")[0].lower().strip("[]")
+        if ohost and ohost not in _LOOPBACK_HOSTS:
+            return jsonify({"ok": False, "error": "forbidden_origin"}), 403
+    return None
 app.config["SECRET_KEY"] = os.urandom(24).hex()
 CORS(app, origins=["http://127.0.0.1:8085", "http://localhost:8085"])
 socketio = SocketIO(app, cors_allowed_origins=["http://127.0.0.1:8085", "http://localhost:8085"], async_mode="threading")
@@ -164,6 +300,18 @@ state = {
         "sni_spoof": False,
         "paranoid_mode": False,
         "auto_rotate": False,
+        # Bypass feature set (proxy mode / blockcheck / QUIC)
+        "proxy_doh": True,
+        "proxy_block_quic": False,
+        "proxy_fake_quic": 0,
+        "proxy_strategy": None,
+        "proxy_autopilot": True,
+        "proxy_system_wide": False,
+        "proxy_upstream": "",
+        "tor_binary": "",
+        "tor_bridges": "",
+        "pt_obfs4": "",
+        "pt_snowflake": "",
         "rotate_interval": 3600,
         "antiforensics": False,
         "autostart": False,
@@ -179,8 +327,10 @@ state = {
         "i2p_sam_port": 7656,
         "i2p_hop_count": 3,
         "garlic_routing": True,
-        "geneva_population": 50,
+        "geneva_population": 20,
         "geneva_mutation": 0.15,
+        "geneva_interval": 60,
+        "geneva_target": "discord.com:443",
         "port_knocking": False,
         "port_knock_seq": "7000,8000,9000",
         # ── Новые модули: Пайплайн и Ядро ──────────────────────────────────
@@ -273,11 +423,13 @@ state = {
 log_buffer = deque(maxlen=LOG_BUFFER_SIZE)
 log_lock = threading.Lock()
 stats_lock = threading.Lock()
+state_lock = threading.Lock()  # guards state["config"] mutations (R7-WEB-02)
 
 # Flag: when True, the NCP process was terminated intentionally (preset change,
 # user stop, etc.).  read_process_output checks this to avoid logging
 # "exit code 1" as an ERROR — on Windows, terminate() always gives rc=1.
 _intentional_kill = False
+_intentional_kills = set()  # pids we terminated on purpose (restart/stop)
 
 # Baseline network counters for real traffic measurement
 _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": 0}
@@ -294,6 +446,66 @@ def push_log(level: str, msg: str):
     with log_lock:
         log_buffer.append(entry)
     socketio.emit("log", entry, namespace="/ws")
+
+
+# ── API request logging + JSON 404/405 (R7-WEB-04) ──
+# Каждый изменяющий вызов и каждый неудачный вызов API попадает в лог-панель UI:
+# из отчёта "ничего не работает" всегда видно точный метод+путь+статус.
+@app.after_request
+def _api_request_logger(resp):
+    try:
+        path = request.path
+        if not path.startswith("/api"):
+            return resp
+        code = resp.status_code
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            lvl = "INFO" if code < 400 else ("WARN" if code < 500 else "ERROR")
+            push_log(lvl, f"API {request.method} {path} -> {code}")
+        elif code >= 400:
+            push_log("WARN" if code < 500 else "ERROR",
+                     f"API GET {path} -> {code}")
+    except Exception:
+        pass
+    return resp
+
+
+@app.errorhandler(404)
+def _api_404(e):
+    if request.path.startswith("/api"):
+        push_log("WARN", f"API 404 - нет такого эндпоинта: {request.method} {request.path}")
+        return jsonify({"ok": False,
+                        "error": f"Эндпоинт не найден: {request.method} {request.path}"}), 404
+    return e
+
+
+@app.errorhandler(405)
+def _api_405(e):
+    if request.path.startswith("/api"):
+        push_log("WARN", f"API 405 - неверный метод: {request.method} {request.path}")
+        return jsonify({"ok": False,
+                        "error": f"Метод {request.method} не поддерживается для {request.path}"}), 405
+    return e
+
+
+@app.errorhandler(Exception)
+def _api_unhandled_error(e):
+    """Catch-all: every unhandled exception is logged WITH traceback to the
+    UI log panel and returned as JSON instead of Flask opaque HTML 500."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    import traceback
+    push_log("ERROR", f"Необработанная ошибка {request.method} {request.path}: "
+                      f"{type(e).__name__}: {e}")
+    try:
+        for ln in traceback.format_exc().strip().splitlines()[-8:]:
+            push_log("ERROR", "  " + ln)
+    except Exception:
+        pass
+    if request.path.startswith("/api"):
+        return jsonify({"ok": False,
+                        "error": f"Внутренняя ошибка: {type(e).__name__}: {e}"}), 500
+    return "Internal Server Error", 500
 
 
 def get_uptime() -> str:
@@ -325,6 +537,66 @@ def save_config(cfg: dict):
         push_log("ERROR", f"Config save error: {e}")
 
 
+_VIRTUAL_IFACE_HINTS = (
+    "wi-fi direct", "wifi direct", "bluetooth", "loopback", "pseudo",
+    "vethernet", "vmware", "virtualbox", "hyper-v", "tap-", "tun",
+)
+
+
+def _pick_best_interface(ifaces: list) -> str:
+    """Pick the best connected interface: up + has a routable IPv4."""
+    def score(i):
+        if not i.get("up"):
+            return -1
+        ipv4 = [ip for ip in i.get("ips", [])
+                if "." in ip and not ip.startswith("127.")
+                and not ip.startswith("169.254.")]
+        if not ipv4:
+            return -1
+        s = 10
+        if any(h in i["name"].lower() for h in _VIRTUAL_IFACE_HINTS):
+            s -= 5
+        return s
+    best, best_s = None, -1
+    for i in ifaces:
+        s = score(i)
+        if s > best_s:
+            best, best_s = i, s
+    return best["name"] if best else ""
+
+
+def _resolve_interface(requested: str) -> str:
+    """Validate the configured interface; if it is disconnected or missing,
+    fall back to the best connected adapter so the engine can actually
+    intercept traffic."""
+    req = (requested or "").strip()
+    try:
+        ifaces = list_network_interfaces()
+    except Exception:
+        return req or "auto"
+    if not req or req.lower() == "auto":
+        best = _pick_best_interface(ifaces)
+        if best:
+            push_log("INFO", f"Interface auto-selected: {best}")
+            return best
+        return req or "auto"
+    for i in ifaces:
+        if i["name"] == req:
+            if i.get("up"):
+                return req
+            best = _pick_best_interface(ifaces)
+            push_log("WARN",
+                     f"Адаптер '{req}' отключён (среда передачи недоступна) - "
+                     f"движок не сможет перехватывать через него трафик. "
+                     + (f"Переключаюсь на '{best}'. Смените адаптер в Настройках."
+                        if best else "Подключите сетевой адаптер."))
+            return best or req
+    best = _pick_best_interface(ifaces)
+    push_log("WARN", f"Адаптер '{req}' не найден в системе"
+                     + (f" - переключаюсь на '{best}'" if best else ""))
+    return best or "auto"
+
+
 def list_network_interfaces() -> list:
     interfaces = []
     try:
@@ -334,36 +606,66 @@ def list_network_interfaces() -> list:
             ips = [a.address for a in addr_list if a.family.name in ("AF_INET", "2")]
             is_up = stats[name].isup if name in stats else False
             interfaces.append({"name": name, "ips": ips, "up": is_up})
+        best = _pick_best_interface(interfaces)
+        for i in interfaces:
+            i["recommended"] = (i["name"] == best)
     except Exception as e:
         push_log("WARN", f"Error getting interfaces: {e}")
     return interfaces
+
+
+def _doh_check_any(name, timeout=2.0):
+    """Try several DoH endpoints by direct IP — some ISPs null-route 1.1.1.1."""
+    last = None
+    for ip in ("1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112",
+               "8.8.8.8", "8.8.4.4", "94.140.14.14", "77.88.8.8"):
+        try:
+            return _doh_check(ip, name, timeout)
+        except Exception as e:
+            last = e
+    raise last
 
 
 def _run_selftest_real() -> dict:
     """Runs a real connectivity self-test: checks DNS resolution and TCP
     connectivity to several well-known hosts.  Returns score 0-100."""
     import socket
+    dns_hijack_hint = ("возможен перехват DNS провайдером (ISP DNS hijack) - "
+                       "обычный UDP/53 у провайдеров РФ часто подменяется; "
+                       "используйте режим прокси с DoH - он не зависит от DNS провайдера")
     checks = [
-        ("DNS google.com", lambda: socket.getaddrinfo("google.com", 443, socket.AF_INET)),
-        ("DNS youtube.com", lambda: socket.getaddrinfo("youtube.com", 443, socket.AF_INET)),
-        ("TCP 8.8.8.8:53", lambda: _tcp_check("8.8.8.8", 53)),
-        ("TCP 1.1.1.1:53", lambda: _tcp_check("1.1.1.1", 53)),
-        ("DNS cloudflare.com", lambda: socket.getaddrinfo("cloudflare.com", 443, socket.AF_INET)),
+        ("DNS google.com", lambda: socket.getaddrinfo("google.com", 443, socket.AF_INET), "dns"),
+        ("DNS youtube.com", lambda: socket.getaddrinfo("youtube.com", 443, socket.AF_INET), "dns"),
+        ("TCP 8.8.8.8:53", lambda: _tcp_check("8.8.8.8", 53), "tcp"),
+        ("TCP 1.1.1.1:53", lambda: _tcp_check("1.1.1.1", 53), "tcp"),
+        ("DNS cloudflare.com", lambda: socket.getaddrinfo("cloudflare.com", 443, socket.AF_INET), "dns"),
+        ("DoH (Cloudflare/Google/Quad9/AdGuard/Yandex)", lambda: _doh_check_any("google.com"), "doh"),
     ]
     passed = 0
     issues = 0
-    for name, fn in checks:
+    hints = []
+    dns_failed = 0
+    doh_ok = False
+    for name, fn, kind in checks:
         try:
             fn()
             passed += 1
+            if kind == "doh":
+                doh_ok = True
         except Exception:
             issues += 1
+            if kind == "dns":
+                dns_failed += 1
             push_log("WARN", f"Self-test failed: {name}")
+    if dns_failed and doh_ok:
+        hints.append(dns_hijack_hint)
+        push_log("INFO", f"Self-test: {dns_hijack_hint}")
     score = int(passed / len(checks) * 100)
     result = {
         "ts": datetime.now().isoformat(),
         "score": score,
         "issues": issues,
+        "hints": hints,
     }
     m = state["modules"]["self_test"]
     m["last_run"] = result["ts"]
@@ -374,6 +676,19 @@ def _run_selftest_real() -> dict:
     if len(history) > 10:
         m["history"] = history[-10:]
     return result
+
+
+def _doh_check(ip: str, name: str, timeout: float = 4.0):
+    # DoH-запрос по прямому IP (обход провайдерского DNS): Cloudflare отдаёт
+    # dns-query по plain HTTP на 1.1.1.1. Бросает исключение при неудаче.
+    import urllib.request
+    req = urllib.request.Request(
+        f"http://{ip}/dns-query?name={name}&type=A",
+        headers={"accept": "application/dns-json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode())
+    if data.get("Status") != 0 or not data.get("Answer"):
+        raise RuntimeError(f"DoH status={data.get('Status')}")
 
 
 def _tcp_check(host: str, port: int, timeout: float = 3.0):
@@ -405,6 +720,93 @@ def _get_active_connections() -> int:
         return sum(1 for c in conns if c.status == "ESTABLISHED")
     except Exception:
         return 0
+
+
+_engine_stats_prev = {"dpi_pkts": None, "ts": 0}
+
+
+def _read_engine_stats():
+    """Читает JSON со счётчиками, который ncp.exe пишет по --stats-file."""
+    try:
+        if not ENGINE_STATS_FILE.exists():
+            return None
+        data = json.loads(ENGINE_STATS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        # Движок переписывает файл каждые ~2 с; протухший файл = движок остановлен
+        if abs(time.time() - int(data.get("ts", 0))) > 20:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _apply_engine_stats(data):
+    """Раскладывает реальные счётчики движка по state['modules']."""
+    m = state["modules"]
+    now = time.time()
+
+    dpi = data.get("dpi") or {}
+    pkts = int(dpi.get("packets_total", 0))
+    prev = _engine_stats_prev
+    pps = 0
+    if prev.get("dpi_pkts") is not None and prev.get("ts"):
+        dt = now - prev["ts"]
+        if 0 < dt < 30 and pkts >= prev["dpi_pkts"]:
+            pps = int((pkts - prev["dpi_pkts"]) / dt)
+    prev["dpi_pkts"] = pkts
+    prev["ts"] = now
+    # Секция «Пайплайн и Ядро» = ядро DPI-движка (реальный путь трафика в run-режиме)
+    m["pipeline"]["throughput_pps"] = pps
+    m["pipeline"]["drops"] = int(dpi.get("packets_dropped", 0))
+
+    dl = data.get("dns_leak") or {}
+    if dl.get("active"):
+        m["dns_leak"]["queries_intercepted"] = (int(dl.get("dns_queries_blocked", 0))
+                                                + int(dl.get("stun_packets_blocked", 0)))
+        m["dns_leak"]["leaks_blocked"] = int(dl.get("leaks_detected", 0))
+
+    sf = data.get("session_frag") or {}
+    m["session_frag"]["sessions_fragmented"] = int(sf.get("sessions_reset", 0))
+    m["session_frag"]["fragments_created"] = int(sf.get("total_resets", 0))
+
+    cl = data.get("cross_layer") or {}
+    m["cross_layer"]["correlations_checked"] = int(cl.get("checks_performed", 0))
+    m["cross_layer"]["anomalies_fixed"] = int(cl.get("auto_fixes_applied", 0))
+
+    rt = data.get("rtt_equalizer") or {}
+    m["rtt_equalizer"]["packets_delayed"] = int(rt.get("acks_delayed", 0))
+
+    vn = data.get("volume_normalizer") or {}
+    m["volume_norm"]["padding_bytes"] = int(vn.get("bytes_padded", 0))
+    m["volume_norm"]["normalized_flows"] = int(vn.get("requests_normalized", 0))
+
+    bc = data.get("behavioral_cloak") or {}
+    m["behavioral_cloak"]["actions_emulated"] = int(bc.get("packets_shaped", 0))
+    m["behavioral_cloak"]["patterns_matched"] = int(bc.get("bursts_generated", 0))
+
+    tb = data.get("time_breaker") or {}
+    m["time_breaker"]["correlations_broken"] = int(tb.get("jitters_applied", 0))
+
+    cc = data.get("covert_channel") or {}
+    m["covert_channel"]["bytes_sent"] = int(cc.get("bytes_hidden", 0))
+    m["covert_channel"]["bytes_recv"] = int(cc.get("bytes_extracted", 0))
+    m["covert_channel"]["channels_active"] = (
+        1 if (int(cc.get("messages_sent", 0)) + int(cc.get("messages_received", 0))) > 0 else 0)
+
+    wf = data.get("wf_defense") or {}
+    m["wf_defense"]["packets_padded"] = int(wf.get("real_packets_processed", 0))
+    m["wf_defense"]["overhead_bytes"] = int(wf.get("overhead_bytes", 0))
+
+    pr = data.get("protocol_rotation") or {}
+    m["protocol_rotation"]["rotations_completed"] = int(pr.get("rotations", 0))
+    if pr.get("current_protocol"):
+        m["protocol_rotation"]["current_protocol"] = pr["current_protocol"]
+
+    ar = data.get("as_router") or {}
+    m["as_router"]["routes_diverted"] = int(ar.get("as_switches", 0))
+    if int(ar.get("as_switches", 0)) > 0:
+        m["as_router"]["current_path"] = "multi-AS"
 
 
 def stats_update_loop():
@@ -451,6 +853,12 @@ def stats_update_loop():
                 except Exception as e:
                     push_log("ERROR", f"Self-test error: {e}")
 
+            # Merge real per-module counters exported by the engine
+            eng = _read_engine_stats()
+            if eng:
+                with stats_lock:
+                    _apply_engine_stats(eng)
+
             # Emit real stats via WebSocket
             payload = {**state["stats"], "uptime": get_uptime()}
             socketio.emit("stats", payload, namespace="/ws")
@@ -468,7 +876,7 @@ def read_process_output(proc):
             if line:
                 level = "INFO"
                 ll = line.upper()
-                if "ERROR" in ll or "FAIL" in ll:
+                if "ERROR" in ll or "FAILED" in ll:
                     level = "ERROR"
                 elif "WARN" in ll:
                     level = "WARN"
@@ -487,10 +895,21 @@ def read_process_output(proc):
     # When process exits, log the return code
     try:
         rc = proc.wait(timeout=2)
-        if rc != 0 and not _intentional_kill:
+        if rc != 0 and proc.pid not in _intentional_kills:
             push_log("ERROR", f"NCP process exited with code {rc}")
-        elif rc != 0 and _intentional_kill:
+        elif rc != 0:
             push_log("DEBUG", f"NCP process stopped (code {rc})")
+    except Exception:
+        pass
+    # v1.5.5: if the engine had enabled the Windows system proxy and then died
+    # (crash or external kill), its graceful-exit restore never ran — heal the
+    # settings from here. restore_system_proxy() is a no-op unless the current
+    # settings point at our own 127.0.0.1:<port>.
+    try:
+        import bypass_routes as _br
+        _br.restore_system_proxy(str(NCP_BINARY),
+                                 int(state["config"].get("proxy_port", 1080) or 1080),
+                                 log=push_log)
     except Exception:
         pass
 
@@ -499,7 +918,12 @@ def read_process_output(proc):
 
 @app.route("/")
 def index():
-    return send_from_directory(str(STATIC_DIR), "index.html")
+    # Inject the per-start API token — readable only by the same-origin page.
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    meta = '<meta name="ncp-token" content="%s">' % _API_TOKEN
+    if "</head>" in html:
+        html = html.replace("</head>", meta + "</head>", 1)
+    return app.response_class(html, mimetype="text/html")
 
 
 @app.route("/api/status")
@@ -526,9 +950,11 @@ def _build_ncp_args() -> list:
     """Build NCP binary command-line arguments from current config state."""
     binary_path = str(NCP_BINARY)
     cfg = state["config"]
-    args = [binary_path, "run", "--no-license-check",
-            "--interface", cfg.get("interface", "auto"),
+    args = [binary_path, "run", "--no-kill-switch",
+            "--interface", _resolve_interface(cfg.get("interface", "auto")),
             "--preset", cfg.get("dpi_preset", "tspu")]
+    # Live per-module stats export (read back by stats_update_loop)
+    args.extend(["--stats-file", str(ENGINE_STATS_FILE)])
 
     # Module disable flags -- when config toggle is False, pass --no-* to disable
     MODULE_FLAGS = {
@@ -550,6 +976,14 @@ def _build_ncp_args() -> list:
         if not cfg.get(config_key, False):
             args.append(flag)
 
+    # Geneva GA evolution (opt-in via the Geneva panel; probing costs traffic)
+    if state["geneva"].get("running"):
+        args.append("--geneva-evolve")
+        args.extend(["--geneva-target", str(cfg.get("geneva_target", "discord.com:443"))])
+        args.extend(["--geneva-interval", str(int(cfg.get("geneva_interval", 60)))])
+        args.extend(["--geneva-population", str(int(cfg.get("geneva_population", 20)))])
+        args.extend(["--geneva-mutation", str(float(cfg.get("geneva_mutation", 0.15)))])
+
     # Covert channel is opt-in (default off)
     if cfg.get("covert_channel", False):
         args.append("--covert")
@@ -566,6 +1000,19 @@ def _build_ncp_args() -> list:
         custom = cfg.get("zapret_custom_chains")
         if custom and isinstance(custom, list):
             args.extend(["--zapret-chains", ",".join(custom)])
+
+    # v1.6.0: selective packet-level desync (winws2-style). By default the
+    # WinDivert driver mode desyncs every TLS ClientHello; with these options
+    # only the listed domains/IPs get desynced and everything else flows
+    # untouched — faster, cleaner, less fingerprintable.
+    hl_mode = cfg.get("driver_hostlist_mode", "off")
+    hl_file = CONFIG_PATH.parent / "autohostlist.txt"
+    if hl_mode == "include":
+        args.extend(["--hostlist", str(hl_file)])
+    elif hl_mode == "exclude":
+        args.extend(["--hostlist-exclude", str(hl_file)])
+    if cfg.get("driver_ipset_enabled", False):
+        args.extend(["--ipset", str(CONFIG_PATH.parent / "ipset.txt")])
 
     return args
 
@@ -588,6 +1035,12 @@ def api_start():
     binary_ok = binary_exists if platform.system() == "Windows" else (binary_exists and os.access(binary_path, os.X_OK))
     if binary_ok:
         try:
+            # Drop stale engine stats from a previous run
+            try:
+                ENGINE_STATS_FILE.unlink(missing_ok=True)
+                _engine_stats_prev.update({"dpi_pkts": None, "ts": 0})
+            except Exception:
+                pass
             args = _build_ncp_args()
             # Set cwd to binary's directory so it finds DLLs (WinDivert.dll, wpcap.dll)
             binary_dir = str(Path(binary_path).parent)
@@ -634,6 +1087,17 @@ def api_start():
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
+    # v1.5.5: always stop the desync proxy and restore the Windows system
+    # proxy FIRST — even when the engine itself is not running, the proxy
+    # may still be holding ProxyEnable=1 pointed at a dead local port.
+    try:
+        import bypass_routes as _br
+        _br.ensure_proxy_stopped(str(NCP_BINARY),
+                                 int(state["config"].get("proxy_port", 1080) or 1080),
+                                 log=push_log)
+    except Exception as _px_err:
+        logger.warning(f"proxy cleanup on stop failed: {_px_err}")
+
     if not state["running"]:
         return jsonify({"ok": False, "error": "NCP not running"}), 409
 
@@ -641,6 +1105,7 @@ def api_stop():
     if proc and proc.poll() is None:
         global _intentional_kill
         _intentional_kill = True
+        _intentional_kills.add(proc.pid)
         proc.terminate()
         try:
             proc.wait(timeout=5)
@@ -673,8 +1138,12 @@ def api_set_config():
     if err:
         return err
     data = request.get_json(force=True) or {}
-    state["config"].update(data)
-    save_config(state["config"])
+    # Never accept a nested {"config": {...}} payload — config is a flat dict
+    data.pop("config", None)
+    with state_lock:
+        state["config"].update(data)
+        cfg_snapshot = dict(state["config"])
+    save_config(cfg_snapshot)
     push_log("INFO", "Configuration updated")
     return jsonify({"ok": True, "config": state["config"]})
 
@@ -737,6 +1206,7 @@ def _restart_ncp_process():
     proc = state.get("process")
     if proc and proc.poll() is None:
         _intentional_kill = True
+        _intentional_kills.add(proc.pid)
         proc.terminate()
         try:
             proc.wait(timeout=5)
@@ -752,6 +1222,12 @@ def _restart_ncp_process():
     binary_ok = binary_exists if platform.system() == "Windows" else (binary_exists and os.access(binary_path, os.X_OK))
     if binary_ok:
         try:
+            # Drop stale engine stats from a previous run
+            try:
+                ENGINE_STATS_FILE.unlink(missing_ok=True)
+                _engine_stats_prev.update({"dpi_pkts": None, "ts": 0})
+            except Exception:
+                pass
             args = _build_ncp_args()
             binary_dir = str(Path(binary_path).parent)
             push_log("INFO", f"Launching: {' '.join(args)}")
@@ -1152,7 +1628,7 @@ def api_license():
 
 # Маппинг планов для UI
 PLAN_LABELS = {
-    "trial": "Trial (14 days)",
+    "trial": "Пробный период (7 дней)",
     "basic": "Basic",
     "pro": "Pro",
     "ultimate": "Ultimate (Lifetime)",
@@ -1453,7 +1929,16 @@ def api_geneva_start():
     state["geneva"]["best_fitness"] = 0.0
     state["geneva"]["fitness_history"] = []
     push_log("INFO", "Geneva GA started - strategy evolution delegated to NCP binary")
-    push_log("INFO", "Note: Geneva evolution runs inside the C++ engine when NCP is active")
+    # Evolution runs INSIDE the ncp binary (needs --geneva-evolve on its
+    # command line, added by _build_ncp_args when state["geneva"]["running"]).
+    # If the engine is already active, restart it so the flag takes effect.
+    if state.get("running") and not state.get("simulation") and state.get("process"):
+        push_log("INFO", "Engine active - restarting NCP with Geneva evolution enabled...")
+        _restart_ncp_process()
+    elif state.get("running"):
+        push_log("WARN", "Simulation mode: Geneva evolution requires the real NCP binary")
+    else:
+        push_log("INFO", "Geneva evolution armed - it will start with the engine (Start Protection)")
     return jsonify({"ok": True})
 
 
@@ -1462,19 +1947,56 @@ def api_geneva_stop():
     state["geneva"]["running"] = False
     push_log("INFO", f"Geneva GA stopped. Generation: {state['geneva']['generation']}, "
              f"Best fitness: {state['geneva']['best_fitness']:.4f}")
+    # Restart the engine without --geneva-evolve so probing actually stops
+    if state.get("running") and not state.get("simulation") and state.get("process"):
+        push_log("INFO", "Restarting NCP without Geneva evolution...")
+        _restart_ncp_process()
     return jsonify({"ok": True, "geneva": state["geneva"]})
 
 
 @app.route("/api/geneva/status")
 def api_geneva_status():
-    return jsonify(state["geneva"])
+    g = dict(state["geneva"])
+    eng = _read_engine_stats()
+    if eng:
+        if isinstance(eng.get("geneva"), dict):
+            ga = eng["geneva"]
+            g["engine"] = ga
+            # Promote live GA counters from the engine stats file into the
+            # top-level fields the Geneva panel polls. Raw fitness scores
+            # (FitnessResult.score(), max ~1000) are normalized to 0..1 for
+            # the UI, which renders best_fitness * 100 as a percentage.
+            if ga.get("ga_running"):
+                gen = int(ga.get("generation", 0))
+                norm_best = min(float(ga.get("best_fitness", 0.0)) / 1000.0, 1.0)
+                norm_avg = min(float(ga.get("avg_fitness", 0.0)) / 1000.0, 1.0)
+                g["generation"] = gen
+                g["best_fitness"] = round(norm_best, 4)
+                g["avg_fitness"] = round(norm_avg, 4)
+                g["evaluations"] = int(ga.get("evaluations", 0))
+                if ga.get("best_strategy"):
+                    g["best_strategy"] = ga["best_strategy"]
+                hist = list(state["geneva"].get("fitness_history") or [])
+                if gen > int(state["geneva"].get("generation", 0)):
+                    hist.append(round(norm_best, 4))
+                    hist = hist[-200:]
+                    state["geneva"]["fitness_history"] = hist
+                    state["geneva"]["generation"] = gen
+                    state["geneva"]["best_fitness"] = round(norm_best, 4)
+                    if ga.get("best_strategy"):
+                        state["geneva"]["best_strategy"] = ga["best_strategy"]
+                g["fitness_history"] = hist
+        if isinstance(eng.get("dpi"), dict):
+            g["engine_interception"] = bool(eng["dpi"].get("interception_active"))
+    return jsonify(g)
 
 
 @app.route("/api/version")
 def api_version():
     return jsonify({
         "version": "1.4.0-dev",
-        "build": "web-" + datetime.now().strftime("%Y%m%d"),
+        "build": ("web-" + datetime.now().strftime("%Y%m%d")
+                  + ("" if BUILD_STAMP.startswith("__") else "-" + BUILD_STAMP)),
         "platform": platform.system(),
         "python": sys.version.split()[0],
     })
@@ -1636,6 +2158,7 @@ def _initial_logs():
         # Check for required DLLs next to binary, auto-copy from SDK if missing
         bin_dir = NCP_BINARY.parent
         _windivert_sdk_dirs = [
+            EXE_DIR,  # user drops WinDivert.dll/.sys next to the launcher
             Path(r"C:\WinDivert-2.2.2-A\x64"),
             Path(r"C:\WinDivert-2.2.2-A"),
             Path(r"C:\WinDivert\x64"),
@@ -1665,16 +2188,95 @@ def _initial_logs():
     push_log("INFO", "Ready")
 
 
+# ── Bypass feature routes (proxy / blockcheck / hostlists / zapret import /
+#    detector / availability / autostart / auto-update) ──
+try:
+    import bypass_routes
+    bypass_routes.register_bypass_routes(app, {
+        "state": state,
+        "push_log": push_log,
+        "save_config": save_config,
+        "ncp_binary": str(NCP_BINARY),
+        "config_dir": CONFIG_PATH.parent,
+        "exe_dir": EXE_DIR,
+    })
+    logger.info("Bypass routes registered")
+except Exception as _bypass_err:
+    logger.warning(f"Bypass routes not available: {_bypass_err}")
+
+
+# ── Enterprise module routes (SPA / Reality / Stego-DNS / Port-Hopping /
+#    Fog mesh / XDP diagnostics) ──
+try:
+    import enterprise_routes
+    enterprise_routes.register_enterprise_routes(app, {
+        "state": state,
+        "push_log": push_log,
+        "save_config": save_config,
+        "ncp_binary": str(NCP_BINARY),
+        "config_dir": CONFIG_PATH.parent,
+        "exe_dir": EXE_DIR,
+        "require_license": _require_license,
+    })
+    logger.info("Enterprise routes registered")
+except Exception as _ent_err:
+    logger.warning(f"Enterprise routes not available: {_ent_err}")
+
+
 if __name__ == "__main__":
     # Restore saved license
     _try_restore_license()
+
+    # Auto-issue 7-day trial on first run (if no full license)
+    _ensure_trial()
 
     # Start background stats thread (collects REAL network stats, no simulation)
     stats_thread = threading.Thread(target=stats_update_loop, daemon=True)
     stats_thread.start()
 
+    # v1.5.5: heal a stale system proxy left behind by a previous crash/kill,
+    # and guarantee restore-on-exit no matter how the GUI terminates.
+    try:
+        import atexit
+        import bypass_routes as _br
+        _px_port = int(state["config"].get("proxy_port", 1080) or 1080)
+        _br.heal_stale_system_proxy(str(NCP_BINARY), _px_port, log=push_log)
+        atexit.register(_br.ensure_proxy_stopped, str(NCP_BINARY), _px_port, push_log)
+    except Exception as _heal_err:
+        logger.warning(f"startup proxy heal failed: {_heal_err}")
+
     _initial_logs()
 
     port = int(os.environ.get("NCP_WEB_PORT", 8085))
+
+    # Windows tray icon (frozen builds only, best-effort)
+    if FROZEN and platform.system() == "Windows":
+        try:
+            import ncp_tray
+            def _tray_open():
+                try:
+                    import webbrowser
+                    webbrowser.open(f"http://127.0.0.1:{port}")
+                except Exception:
+                    pass
+            def _tray_quit():
+                os._exit(0)
+            if ncp_tray.start_tray("NCP — защита активна", _tray_open, _tray_quit):
+                push_log("INFO", "Tray icon active")
+        except Exception as _tray_err:
+            push_log("WARN", f"Tray icon failed: {_tray_err}")
     logger.info(f"Starting NCP Web Interface on 127.0.0.1:{port}")
+
+    # Frozen app: open the control panel in the default browser automatically
+    if (FROZEN or os.environ.get("NCP_OPEN_BROWSER") == "1") \
+            and os.environ.get("NCP_NO_BROWSER") != "1":
+        def _open_browser():
+            time.sleep(1.5)
+            try:
+                import webbrowser
+                webbrowser.open(f"http://127.0.0.1:{port}")
+            except Exception:
+                pass
+        threading.Thread(target=_open_browser, daemon=True).start()
+
     socketio.run(app, host="127.0.0.1", port=port, debug=False, allow_unsafe_werkzeug=True)

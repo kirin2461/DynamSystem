@@ -13,8 +13,10 @@
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
 #include <openssl/err.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #include <openssl/param_build.h>
 #include <openssl/core_names.h>
+#endif
 #include <openssl/crypto.h>
 
 #ifdef HAVE_LIBOQS
@@ -52,12 +54,14 @@ struct EC_POINT_Deleter {
 struct BN_CTX_Deleter {
     void operator()(BN_CTX* p) const { if (p) BN_CTX_free(p); }
 };
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
 struct OSSL_PARAM_BLD_Deleter {
     void operator()(OSSL_PARAM_BLD* p) const { if (p) OSSL_PARAM_BLD_free(p); }
 };
 struct OSSL_PARAM_Deleter {
     void operator()(OSSL_PARAM* p) const { if (p) OSSL_PARAM_free(p); }
 };
+#endif
 
 using UniqueEVP_PKEY     = std::unique_ptr<EVP_PKEY, EVP_PKEY_Deleter>;
 using UniqueEVP_PKEY_CTX = std::unique_ptr<EVP_PKEY_CTX, EVP_PKEY_CTX_Deleter>;
@@ -65,8 +69,10 @@ using UniqueBN           = std::unique_ptr<BIGNUM, BN_Deleter>;
 using UniqueEC_KEY       = std::unique_ptr<EC_KEY, EC_KEY_Deleter>;
 using UniqueEC_POINT     = std::unique_ptr<EC_POINT, EC_POINT_Deleter>;
 using UniqueBN_CTX       = std::unique_ptr<BN_CTX, BN_CTX_Deleter>;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
 using UniqueOSSL_PARAM_BLD = std::unique_ptr<OSSL_PARAM_BLD, OSSL_PARAM_BLD_Deleter>;
 using UniqueOSSL_PARAM     = std::unique_ptr<OSSL_PARAM, OSSL_PARAM_Deleter>;
+#endif
 
 // Fallback for OpenSSL 1.1.1 (EVP_PKEY_fromdata not available)
 // R15-H02: Full RAII — no manual cleanup needed
@@ -230,7 +236,8 @@ KeyPair generate_ratchet_keypair(KeyExchangeProtocol protocol) {
                 throw std::runtime_error("P256 ratchet keygen failed");
             UniqueEVP_PKEY upkey(pkey);
 
-            size_t pub_len = 0;
+            #if OPENSSL_VERSION_NUMBER >= 0x30000000L
+size_t pub_len = 0;
             EVP_PKEY_get_octet_string_param(upkey.get(), OSSL_PKEY_PARAM_PUB_KEY, nullptr, 0, &pub_len);
             kp.public_key = SecureMemory(pub_len);
             EVP_PKEY_get_octet_string_param(upkey.get(), OSSL_PKEY_PARAM_PUB_KEY, kp.public_key.data(), pub_len, &pub_len);
@@ -243,6 +250,22 @@ KeyPair generate_ratchet_keypair(KeyExchangeProtocol protocol) {
             size_t priv_len = static_cast<size_t>(BN_num_bytes(priv_bn.get()));
             kp.private_key = SecureMemory(priv_len);
             BN_bn2bin(priv_bn.get(), kp.private_key.data());
+#else
+            // OpenSSL 1.1.x: extract via legacy EC_KEY API
+            UniqueEC_KEY ec(EVP_PKEY_get1_EC_KEY(upkey.get()));
+            if (!ec) throw std::runtime_error("P256 ratchet: get1_EC_KEY failed");
+            const EC_GROUP* grp = EC_KEY_get0_group(ec.get());
+            const EC_POINT* pub = EC_KEY_get0_public_key(ec.get());
+            UniqueBN_CTX bnctx(BN_CTX_new());
+            size_t pub_len = EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, nullptr, 0, bnctx.get());
+            if (pub_len == 0) throw std::runtime_error("P256 ratchet: point2oct failed");
+            kp.public_key = SecureMemory(pub_len);
+            EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, kp.public_key.data(), pub_len, bnctx.get());
+            const BIGNUM* priv = EC_KEY_get0_private_key(ec.get());
+            size_t priv_len = static_cast<size_t>(BN_num_bytes(priv));
+            kp.private_key = SecureMemory(priv_len);
+            BN_bn2bin(priv, kp.private_key.data());
+#endif
             break;
         }
         case KeyExchangeProtocol::X25519:
@@ -333,7 +356,11 @@ void append_blob(std::vector<uint8_t>& out, const std::vector<uint8_t>& vec) { a
 
 struct E2ESession::Impl {
     E2EConfig config;
-    std::mutex mutex;
+    // recursive_mutex: public methods legitimately call other public methods
+    // while holding the lock (process_key_exchange_request ->
+    // compute_shared_secret -> decapsulate). A plain std::mutex self-deadlocks
+    // there (found by functional check: hang in FUTEX_WAIT).
+    std::recursive_mutex mutex;
     std::string session_id;
     E2ESessionState state = E2ESessionState::Uninitialized;
     std::chrono::system_clock::time_point last_activity;
@@ -468,7 +495,7 @@ E2ESession::E2ESession(const E2EConfig& config) : pImpl_(std::make_unique<Impl>(
 E2ESession::~E2ESession() = default;
 
 KeyPair E2ESession::generate_key_pair() {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     return generate_ratchet_keypair(pImpl_->config.key_exchange);
 }
 
@@ -506,7 +533,7 @@ SecureMemory E2ESession::decapsulate(const KeyPair& local_keypair, const std::ve
 }
 
 SecureMemory E2ESession::compute_shared_secret(const KeyPair& local_keypair, const std::vector<uint8_t>& peer_public_key) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (local_keypair.protocol == KeyExchangeProtocol::Kyber1024) {
         // Kyber1024 is a KEM: sender encaps, receiver decaps
         // If we have a stored ciphertext, we're the receiver → decapsulate
@@ -530,7 +557,7 @@ SecureMemory E2ESession::compute_shared_secret(const KeyPair& local_keypair, con
 }
 
 std::vector<uint8_t> E2ESession::get_last_kem_ciphertext() const {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (pImpl_->last_kem_ciphertext.size() == 0) return {};
     return std::vector<uint8_t>(pImpl_->last_kem_ciphertext.data(), pImpl_->last_kem_ciphertext.data() + pImpl_->last_kem_ciphertext.size());
 }
@@ -585,7 +612,7 @@ void E2ESession::init_ratchet_keys() {
 }
 
 std::vector<uint8_t> E2ESession::create_key_exchange_request(const KeyPair& local_keys) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     pImpl_->state = E2ESessionState::KeyExchangeInitiated;
     std::vector<uint8_t> request;
     request.push_back(0x10); // Format version
@@ -609,7 +636,7 @@ std::vector<uint8_t> E2ESession::create_key_exchange_request(const KeyPair& loca
 }
 
 std::vector<uint8_t> E2ESession::process_key_exchange_request(const std::vector<uint8_t>& request, const KeyPair& local_keys) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (request.size() < 4) throw std::runtime_error("Invalid KX request");
     uint16_t pk_len = read_u16(request.data() + 2);
     if (request.size() < 4u + pk_len) throw std::runtime_error("KX request too short");
@@ -668,7 +695,7 @@ std::vector<uint8_t> E2ESession::process_key_exchange_request(const std::vector<
 }
 
 bool E2ESession::complete_key_exchange(const std::vector<uint8_t>& response, const KeyPair& local_keys) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (response.size() < 4) return false;
     uint16_t pk_len = read_u16(response.data() + 2);
     if (response.size() < 4u + pk_len) return false;
@@ -731,7 +758,7 @@ EncryptedMessage E2ESession::encrypt_message(
     const std::vector<uint8_t>& plaintext,
     const SecureMemory& encryption_key) {
 
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
 
     EncryptedMessage msg;
     msg.nonce.resize(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
@@ -760,7 +787,7 @@ std::vector<uint8_t> E2ESession::decrypt_message(
     const EncryptedMessage& message,
     const SecureMemory& decryption_key) {
 
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
 
     std::vector<uint8_t> plaintext(message.ciphertext.size());
     unsigned long long pt_len = 0;
@@ -826,7 +853,7 @@ std::optional<std::vector<uint8_t>> E2ESession::decrypt_with_key_(
 }
 
 void E2ESession::ratchet_sending_chain() {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (!pImpl_->ratchet_initialized) return;
     SecureMemory mk;
     pImpl_->kdf_ck(pImpl_->sending_chain_key, mk);
@@ -839,7 +866,7 @@ void E2ESession::ratchet_sending_chain() {
 }
 
 void E2ESession::ratchet_receiving_chain(const std::vector<uint8_t>& remote_public_key) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (!pImpl_->ratchet_initialized) return;
     pImpl_->dh_ratchet_step(remote_public_key);
 }
@@ -847,7 +874,7 @@ void E2ESession::ratchet_receiving_chain(const std::vector<uint8_t>& remote_publ
 // ===== Encrypt/Decrypt with Double Ratchet =====
 // R7-SEC-01: Prevent uint32_t message_number overflow by limiting chain length
 EncryptedMessage E2ESession::encrypt(const std::vector<uint8_t>& plaintext, const std::vector<uint8_t>& associated_data) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (pImpl_->state != E2ESessionState::SessionEstablished || !pImpl_->ratchet_initialized)
         throw std::runtime_error("Session not established");
 
@@ -915,7 +942,7 @@ EncryptedMessage E2ESession::encrypt(const std::vector<uint8_t>& plaintext, cons
 }
 
 std::optional<std::vector<uint8_t>> E2ESession::decrypt(const EncryptedMessage& encrypted_message) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (pImpl_->state != E2ESessionState::SessionEstablished || !pImpl_->ratchet_initialized) return std::nullopt;
 
     const auto& hdr = encrypted_message.header;
@@ -954,7 +981,7 @@ std::optional<std::vector<uint8_t>> E2ESession::decrypt(const EncryptedMessage& 
 // Ensure serialize_session_state includes version check
 
 std::vector<uint8_t> E2ESession::serialize_session_state() const {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     std::vector<uint8_t> out;
     out.push_back(0x02); // Serialized version 2
     
@@ -991,7 +1018,7 @@ std::vector<uint8_t> E2ESession::serialize_session_state() const {
 }
 
 bool E2ESession::restore_session_state(const std::vector<uint8_t>& data) {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (data.size() < 21) return false;
     size_t pos = 0;
     uint8_t ver = data[pos++];
@@ -1066,20 +1093,20 @@ bool E2ESession::restore_session_state(const std::vector<uint8_t>& data) {
 }
 
 E2ESessionState E2ESession::get_state() const { return pImpl_->state; }
-bool E2ESession::is_established() const { std::lock_guard<std::mutex> lock(pImpl_->mutex); return pImpl_->state == E2ESessionState::SessionEstablished; }
+bool E2ESession::is_established() const { std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex); return pImpl_->state == E2ESessionState::SessionEstablished; }
 bool E2ESession::is_expired() const { 
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     auto now = std::chrono::system_clock::now();
     return (now - pImpl_->session_created_at) >= pImpl_->config.session_timeout;
 }
 void E2ESession::rotate_keys() {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     if (!pImpl_->ratchet_initialized) return;
     pImpl_->local_ratchet_kp = generate_ratchet_keypair(pImpl_->config.key_exchange);
     if (!pImpl_->remote_ratchet_pub.empty()) pImpl_->dh_ratchet_step(pImpl_->remote_ratchet_pub);
 }
 void E2ESession::revoke_session() {
-    std::lock_guard<std::mutex> lock(pImpl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex);
     pImpl_->state = E2ESessionState::SessionRevoked;
     if (pImpl_->ratchet.root_key.size() > 0) sodium_memzero(pImpl_->ratchet.root_key.data(), pImpl_->ratchet.root_key.size());
     if (pImpl_->sending_chain_key.size() > 0) sodium_memzero(pImpl_->sending_chain_key.data(), pImpl_->sending_chain_key.size());
@@ -1088,9 +1115,9 @@ void E2ESession::revoke_session() {
     pImpl_->ratchet.skipped_keys.clear();
 }
 std::string E2ESession::get_session_id() const { return pImpl_->session_id; }
-std::chrono::system_clock::time_point E2ESession::get_last_activity() const { std::lock_guard<std::mutex> lock(pImpl_->mutex); return pImpl_->last_activity; }
-uint64_t E2ESession::get_messages_sent() const { std::lock_guard<std::mutex> lock(pImpl_->mutex); return pImpl_->messages_sent; }
-uint64_t E2ESession::get_messages_received() const { std::lock_guard<std::mutex> lock(pImpl_->mutex); return pImpl_->messages_received; }
+std::chrono::system_clock::time_point E2ESession::get_last_activity() const { std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex); return pImpl_->last_activity; }
+uint64_t E2ESession::get_messages_sent() const { std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex); return pImpl_->messages_sent; }
+uint64_t E2ESession::get_messages_received() const { std::lock_guard<std::recursive_mutex> lock(pImpl_->mutex); return pImpl_->messages_received; }
 
 // ===== E2EManager =====
 struct E2EManager::Impl {
